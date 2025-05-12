@@ -8,7 +8,6 @@ sys.path.insert(0, os.path.expanduser("~/TrainingCode/csm"))
 import torch
 import torch.nn as nn
 from datasets import load_dataset
-from transformers import AutoTokenizer
 from huggingface_hub import hf_hub_download
 
 from moshi.models import loaders
@@ -60,11 +59,6 @@ class Audio2CodebooksCPU(nn.Module):
         self.csm = CSMModel.from_pretrained(csm_repo)
         self.csm.backbone = self.language_model
 
-        # --- 4) Tokenizer & caches (optional) ---
-        # self.tok = AutoTokenizer.from_pretrained(tokenizer_id)
-        # self.csm.setup_caches(max_batch_size=1)
-        # self.ul.reset_caches()
-
         # --- 5) Freeze everything ---
         for p in self.parameters():
             p.requires_grad = False
@@ -83,21 +77,15 @@ class Audio2CodebooksCPU(nn.Module):
         # (a) CNN encoder → (B, hidden, T1)
         cnn_emb = self.mimi.encoder(wav)
 
-        # (b) Transformer encoder → (B, T1, hidden)
-        trans_out = self.mimi.encoder_transformer(
-            cnn_emb.transpose(1, 2),
-            return_dict=True
-        )
-        sem = trans_out.last_hidden_state                   # (B, T1, hidden)
+        # (b) Transformer encoder → tuple: (hidden_states, past_key_values)
+        trans_out = self.mimi.encoder_transformer(cnn_emb.transpose(1, 2))
+        sem = trans_out[0]                   # (B, T1, hidden)
 
         # (c) to channel-first for downsample: (B, hidden, T1)
         sem_cf = sem.transpose(1, 2)
 
         # (d) optional downsample → (B, hidden, T2)
-        if self.mimi.downsample is not None:
-            quant_in = self.mimi.downsample(sem_cf)
-        else:
-            quant_in = sem_cf
+        quant_in = self.mimi.downsample(sem_cf) if self.mimi.downsample is not None else sem_cf
 
         # (e) quantize with all codebooks → (Q, B, T2)
         all_codes = self.mimi.quantizer.encode(
@@ -111,15 +99,12 @@ class Audio2CodebooksCPU(nn.Module):
         # (g) permute to (B, Q-1, T2)
         codes = acoustic_codes.permute(1, 0, 2)
 
-        # sem is (B, T1, hidden), codes is (B, Q-1, T2)
-
         # === 2) Acoustic embedding → (B, T2, hidden) ===
         flat   = codes.reshape(-1)
         emb_ac = self.csm.audio_embeddings(flat).view(*codes.shape, -1)
-        ac     = emb_ac.mean(dim=2)                   # (B, Q-1, hidden) → mean→ (B, hidden)
+        ac     = emb_ac.mean(dim=2)                   # (B, hidden)
 
-        # but we need (B, T1, hidden) to match sem: up/down-sample ac to T1 if needed
-        # here we simply unsqueeze time dim to broadcast
+        # broadcast to match sem time dimension
         ac = ac.unsqueeze(1).expand(-1, sem.size(1), -1)  # (B, T1, hidden)
 
         # === 3) Gating fusion ===
@@ -159,7 +144,6 @@ class Audio2CodebooksCPU(nn.Module):
         return waveform
 
 if __name__ == "__main__":
-    # Initialize on CPU
     device = torch.device('cpu')
     model = Audio2CodebooksCPU(
         ul_cfg_or_path       = "fixie-ai/ultravox-v0_2",
@@ -169,7 +153,6 @@ if __name__ == "__main__":
         audio_num_codebooks  = 32,
     )
 
-    # Inference on first 5 samples of Expresso
     ds = load_dataset("ylacombe/expresso", split="train[:5]")
     print(f"Loaded {len(ds)} examples for inference.")
 
