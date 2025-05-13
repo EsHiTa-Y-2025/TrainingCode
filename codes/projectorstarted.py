@@ -38,10 +38,12 @@ class Audio2CodebooksCPU(nn.Module):
         self.mimi.set_num_codebooks(audio_num_codebooks)
         self.mimi_config = MimiConfig.from_pretrained("kyutai/mimi")
         self.num_quantizers = audio_num_codebooks
-       # h_mimi = self.mimi_config.hidden_size
+
         h_mimi = 512
-        self.ac_proj = nn.Linear(2048, 512)
+        self.ac_proj = nn.Linear(2048, 6144, bias=False)
+        self.sem_proj = nn.Linear(512, 6144, bias=False)
 #        self.gate = nn.Linear(sem_dim + ac_dim, hidden_dim)
+        self.fused_proj = nn.Linear(512, 262144)  # or whatever `fused.shape[-1]` is → 6144 i>
 
 
         # --- 2) UltravoxModel (LLM + projector) ---
@@ -54,6 +56,7 @@ class Audio2CodebooksCPU(nn.Module):
                       )
         self.ul.tie_weights()
         self.projector      = self.ul.multi_modal_projector
+        self.projector._pad_and_stack = nn.Identity()
         self.language_model = self.ul.language_model
 
         # --- 3) CSM decoder (with both flavors) ---
@@ -73,7 +76,7 @@ class Audio2CodebooksCPU(nn.Module):
 
         # gating layers for fusion
 #        D = self.ul.config.hidden_size
-        self.gate = nn.Linear(1024, h_mimi)
+        self.gate = nn.Linear(2 * 6144, 6144)
         self.sig  = nn.Sigmoid()
 
     def forward(self, raw_audio: torch.Tensor) -> torch.Tensor:
@@ -88,8 +91,6 @@ class Audio2CodebooksCPU(nn.Module):
         cnn_time = cnn_emb.transpose(1, 2)
 #        cnn_time = cnn_time.squeeze(0)
         print("cnn_emb.shape:", cnn_emb.shape)
-
-
         print("cnn_time:", cnn_time.shape)
         print("completed cnn_time")
 
@@ -167,20 +168,26 @@ class Audio2CodebooksCPU(nn.Module):
         print("sem.shape:", sem.shape)  # expect (..., 512)
         print("ac.shape:",  ac.shape)   # expect (..., 512)
 
-        ac_cf = ac.transpose(1, 2)
-        if self.mimi.upsample is not None:
+        ac_hp = self.ac_proj(ac)
+        sem = sem.permute(0, 2, 1)
+        sem_hp = self.sem_proj(sem)
+
+
+
+#        ac_cf = ac.transpose(1, 2)
+ #       if self.mimi.upsample is not None:
 #            ac_up = self.mimi.upsample(ac_cf)
-            ac_cf_proj = self.ac_proj(ac_cf.transpose(1, 2)).transpose(1, 2)  # [B, 512, T]
-            ac_up = self.mimi.upsample(ac_cf_proj)
-        else:
+ #           ac_cf_proj = self.ac_proj(ac_cf.transpose(1, 2)).transpose(1, 2)  # [B, 512, T]
+ #           ac_up = self.mimi.upsample(ac_cf_proj)
+ #       else:
             # Option B: linear interpolate from 69 → 138
-            import torch.nn.functional as F
-            ac_up = F.interpolate(ac_cf, size=sem.size(1), mode="linear", align_corners=False)
+#            import torch.nn.functional as F
+#            ac_up = F.interpolate(ac_cf, size=sem.size(1), mode="linear", align_corners=Fals>
 
             # Back to time-first:
-        ac = ac_up.transpose(1, 2)      # ➜ (B, T1, hidden)
+#        ac = ac_up.transpose(1, 2)      # ➜ (B, T1, hidden)
 
-        sem = sem.permute(0, 2, 1)  # From [B, H, T] → [B, T, H]
+#        sem = sem.permute(0, 2, 1)  # From [B, H, T] → [B, T, H]
 #        sem = sem.transpose(1, 2)
         print("gatingsem.shape:", sem.shape)
         print("gatingac.shape: ", ac.shape)
@@ -190,39 +197,58 @@ class Audio2CodebooksCPU(nn.Module):
 #        cat   = torch.cat([sem, ac], dim=-1)         # (B, T1, 2*hidden)
 #        g     = self.sig(self.gate(cat))            # (B, T1, hidden)
 #        fused = g * sem + (1 - g) * ac              # (B, T1, hidden)
+
+        import torch.nn.functional as F
+        ac_up = F.interpolate(
+            ac_hp.transpose(1, 2),      # to (B, 4096, 69)
+            size=sem_hp.size(1),         # 138
+            mode="linear",
+            align_corners=False
+        ).transpose(1, 2)
+
         print("gating started")
 
-        if ac.shape[1] != sem.shape[1]:
-            import torch.nn.functional as F
-            ac = F.interpolate(ac.transpose(1, 2), size=sem.shape[1], mode="linear", align_corners=False).transpose(1, 2)
+#        if ac.shape[1] != sem.shape[1]:
+#            import torch.nn.functional as F
+#            ac = F.interpolate(ac.transpose(1, 2), size=sem.shape[1], mode="linear", align_c>
+
+        print("sem_hp: ", sem_hp.shape)
+        print("ac_up: ", ac_up.shape)
+
         print("cat before")
-        cat = torch.cat([sem, ac], dim=-1)
+        cat = torch.cat([sem_hp, ac_up], dim=-1)
         print("cate completed")
         g     = self.sig(self.gate(cat))
         print("g completd")
-        fused = g * sem + (1 - g) * ac
+        fused = g * sem_hp + (1 - g) * ac_up
         print("fused completd")
         print("gating completed")
-
-
  # cat = torch.cat([sem, ac], dim=-1)
 #        g = self.sig(self.gate(cat))
  #       fused = g * sem + (1 - g) * ac
-
+        print("beforefused.shape: ", fused.shape)
+#        proj_input = self.fused_proj(fused)  # [B, T, 4096]
+        proj = self.projector(fused)
+        print("fused.shape: ", fused.shape)
 
 
         # === 4) Project to LLM space & 5) Ultravox LLM forward ===
         print("projector started")
-        proj = self.projector(fused)
+#        proj_input = self.fused_proj(fused)  # [B, T, 4096]
+ #       proj = self.projector(proj_input)
+        print("fused.shape: ", fused.shape)
+#        proj = self.projector(fused)
         print("projector completed")
+        print("LLM put into")
         with torch.no_grad():
             out = self.language_model(
                 inputs_embeds=proj,
                 return_dict=True,
                 output_hidden_states=True,
             )
-
         h = out.hidden_states[-1]                  # (B, T1, hidden)
+        print("hidden states computed")
+        print(h)
 
         # === 6) CSM generate audio codes & 7) Decode to waveform ===
         B = h.size(0)
